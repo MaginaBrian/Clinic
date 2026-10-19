@@ -80,7 +80,7 @@ Pipeline (`.github/workflows/ci-cd.yml`):
 
 - On every pull request and every push, GitHub Actions installs the Python dependencies and runs `python manage.py test clinic`.
 - Render deploys the linked branch only after that check passes.
-- The deploy runs `build.sh`, then the pre-deploy command (`migrate` and `seed_clinic`), then gunicorn.
+- The deploy runs `build.sh`, then starts the service. Startup migrates the database, seeds the five doctors, and then runs gunicorn. Free instances cannot use a separate pre-deploy command.
 
 Approve the first deploy here:
 
