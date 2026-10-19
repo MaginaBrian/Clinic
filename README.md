@@ -1,101 +1,155 @@
-# Mwangaza Clinic
+# Mwangaza Clinic — Appointment Booking
 
-Patients book 30-minute appointments with one of five doctors. A booked slot disappears for everyone else. Cancelling or rescheduling puts the old time back.
+A clinic booking application for five doctors. Patients can view free 30-minute slots, book appointments, cancel, and reschedule.
 
-## Design
+| | Link |
+|---|---|
+| Live application | [https://mwangaza-clinic.onrender.com](https://mwangaza-clinic.onrender.com) |
+| API health | [https://mwangaza-clinic.onrender.com/health](https://mwangaza-clinic.onrender.com/health) |
+| Source code | [https://github.com/MaginaBrian/Clinic](https://github.com/MaginaBrian/Clinic) |
 
-Doctors, patients, weekly working hours, and appointments are the only stored records. Empty slots are not stored. A slot is whatever 30-minute start fits inside a doctor's working blocks for that weekday, minus rows that are still `booked`.
+**Stack:** Django REST Framework, PostgreSQL (SQLite for local development), React + Vite, GitHub Actions, Render. No Docker required.
 
-A doctor can have more than one block on the same weekday. That is how a lunch break is modelled: 09:00–12:30 and 14:00–17:00, not one long shift with a hole punched in it.
+## 1. System design
 
-Cancelled appointments stay in the table. The unique rule is partial: `(doctor, start_time)` must be unique only where `status = booked`. A cancelled row does not block the next booking, and freeing a slot does not require a delete.
+### Models
 
-Times are stored timezone-aware. Working hours are clinic wall-clock times, so the clinic zone is `Africa/Nairobi`. An offset-less booking time is read as Nairobi time.
+| Model | Responsibility |
+|---|---|
+| `Doctor` | Name, specialty, active status |
+| `WorkingHours` | Weekly working blocks, including breaks |
+| `Patient` | Name, phone, optional email |
+| `Appointment` | Doctor, patient, start/end time, status and cancellation details |
 
-Two requests for the same doctor cannot both pass the checks. Each write locks that doctor's row inside a transaction, then validates. The partial unique constraint is the backstop: if a second insert still races through, the database rejects it and the API returns 409.
+A doctor has many working-hour blocks and appointments. A patient can have many appointments.
 
-There is no login in this version. A patient is a name and a phone number. The browser remembers the patient id on that device.
+### Architecture and decisions
 
-## API
+- **Modular backend:** `models.py` stores data, `serializers.py` validates requests, `views.py` handles HTTP, and `services/booking.py` and `services/slots.py` hold business rules.
+- **Generated availability:** The system calculates 30-minute slots from working hours, then removes booked and too-soon slots. This avoids maintaining a separate slots table.
+- **Double-booking protection:** Booking and rescheduling use transactions and doctor row locks. PostgreSQL also enforces a partial unique constraint on `(doctor, start_time)` for active bookings.
+- **Cancellation:** Appointments are marked `cancelled`, not deleted. This keeps a record and releases the slot.
+- **Rescheduling:** The existing appointment is updated after validating the new slot. Its ID stays the same.
+- **Time:** The clinic uses `Africa/Nairobi`. Datetimes are timezone-aware.
+- **Deployment:** Django serves the built React application alongside the API, keeping hosting simple.
 
-Every error uses the same body:
+**Trade-offs:** A modular monolith is easier to run than microservices for five doctors. Doctor-level locking may limit write throughput at much larger scale, but it is appropriate here. Dynamically generated slots are simpler, although future doctor leave and holiday exceptions will need an additional model.
 
-```json
-{"error": {"code": "slot_taken", "message": "...", "details": {}}}
-```
+**Rules I chose:** Bookings must start on a valid 30-minute slot, be at least one hour ahead, and fit fully inside working hours. A patient cannot hold two appointments at the same time. A cancelled appointment cannot be rescheduled. An appointment that has started cannot be cancelled or rescheduled. An off-day returns an empty availability list.
 
-`details` is present for payload validation only.
+**Future work:** Patient authentication and authorization, reminders, doctor leave, multiple clinics, and rate limiting. **This is a demonstration application; without authentication it must not be used for real patient data.**
 
-| Status | When |
-| --- | --- |
-| 400 | The request is wrong: bad payload, past time, inside the one-hour lead, outside working hours, or not on a 30-minute slot start. |
-| 404 | That doctor, patient, or appointment does not exist. |
-| 409 | The request is valid but clashes with current state: slot taken, patient already booked then, or the appointment is already cancelled. |
+## 2. API implementation
 
-| Method | Path | Behaviour |
-| --- | --- | --- |
-| `GET` | `/doctors` | Active doctors. |
-| `GET` | `/doctors/{id}/availability?date=YYYY-MM-DD` | Free 30-minute slots that day. A day the doctor does not work is an empty list, not an error. |
-| `POST` | `/appointments` | Book `doctor_id`, `patient_id`, `start_time`, optional `notes`. |
-| `GET` | `/appointments/{id}` | One appointment. |
-| `PATCH` | `/appointments/{id}/cancel` | Body `{"reason": "..."}`. Reason is required. Already cancelled returns 409. The slot is bookable again. |
-| `PATCH` | `/appointments/{id}/reschedule` | Body `{"start_time": "..."}`. The new time is checked with the same rules as a new booking. A cancelled appointment cannot be moved. |
-| `POST` | `/patients` | Create a patient. |
-| `GET` | `/patients/{id}` | One patient. |
-| `GET` | `/patients/{id}/appointments` | Upcoming booked visits, soonest first. Cancelled visits are left out. |
-| `GET` | `/health` | `{"status": "ok"}`. |
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/doctors` | List doctors |
+| `GET` | `/doctors/{id}/availability?date=YYYY-MM-DD` | Show free slots |
+| `POST` | `/appointments` | Book an appointment |
+| `GET` | `/appointments/{id}` | View an appointment |
+| `PATCH` | `/appointments/{id}/cancel` | Cancel with a reason |
+| `PATCH` | `/appointments/{id}/reschedule` | Move to a valid slot |
+| `POST` | `/patients` | Register a patient |
+| `GET` | `/patients/{id}` | View a patient |
+| `GET` | `/patients/{id}/appointments` | Upcoming appointments (bonus) |
+| `GET` | `/health` | Health check |
 
-Bookings must start at least 60 minutes from now (`MIN_BOOKING_LEAD_MINUTES`).
-
-Domain rules live in `backend/clinic/services/`. Views only parse input and call those functions. Tests cover availability, booking, cancel, reschedule, and the patient list (`python manage.py test clinic`, 42 tests).
-
-## Run locally
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r backend/requirements.txt
-DEBUG=1 .venv/bin/python backend/manage.py migrate
-DEBUG=1 .venv/bin/python backend/manage.py seed_clinic
-DEBUG=1 .venv/bin/python backend/manage.py runserver 127.0.0.1:8000
-```
-
-In another terminal:
+Example booking request:
 
 ```bash
-npm install --prefix frontend
-npm run dev --prefix frontend
+curl -X POST http://localhost:8000/appointments \
+  -H 'Content-Type: application/json' \
+  -d '{"doctor_id":1,"patient_id":1,"start_time":"2026-11-03T10:00:00+03:00"}'
 ```
 
-Open http://127.0.0.1:5173/. Vite proxies `/doctors`, `/appointments`, and `/patients` to port 8000. SQLite is the local database. Production uses `DATABASE_URL`.
+The API returns `201` for a successful booking, `400` for invalid requests, `404` for missing records, and `409` for conflicts. Errors use a consistent JSON format: `{"error":{"code":"slot_taken","message":"..."}}`.
 
-## Deployment and CI/CD
+**Testing:** Tests are in `backend/clinic/tests/` and cover availability, working-hour boundaries, invalid dates, double bookings, cancellation, rescheduling, timezone handling, patient appointments, and database constraints. Run the tests to confirm results before submission.
 
-The app is one Render web service. `build.sh` installs Python dependencies, builds the React app, and copies it to `backend/frontend_dist`. WhiteNoise serves that folder at `/`, and Django serves the API on the same host.
+## 3. Run locally and deploy
 
-`render.yaml` is the blueprint. It creates the web service and a Postgres database in Frankfurt. `autoDeployTrigger` is `checksPass`, so Render ships a new build only after the GitHub Actions test check on that commit succeeds.
+**Requirements:** Python 3.12+, Node.js 22+.
 
-Public URL: https://mwangaza-clinic.onrender.com once the blueprint has finished its first deploy. Render will show the exact hostname on the service page if that name is already taken.
+### Backend
 
-Pipeline (`.github/workflows/ci-cd.yml`):
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+export DEBUG=true
+python manage.py migrate
+python manage.py seed_clinic
+python manage.py runserver
+```
 
-- On every pull request and every push, GitHub Actions installs the Python dependencies and runs `python manage.py test clinic`.
-- Render deploys the linked branch only after that check passes.
-- The deploy runs `build.sh`, then starts the service. Startup migrates the database, seeds the five doctors, and then runs gunicorn. Free instances cannot use a separate pre-deploy command.
+Backend: `http://localhost:8000`.
 
-Approve the first deploy here:
+### Frontend (new terminal)
 
-https://render.com/deploy?repo=https://github.com/MaginaBrian/Clinic/tree/cursor/assessment-sections-693d
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-Sign in, connect GitHub if Render asks, review the web service and database, then click Deploy Blueprint. Later pushes to the linked branch go out on their own after the tests pass. After this branch is merged, point the service at `main` in the Render dashboard.
+Frontend: `http://localhost:5173`. Commit the generated `frontend/package-lock.json` so CI and Render can use `npm ci`.
 
-`SECRET_KEY` is generated by Render. `DEBUG` is false there. The five doctors are seeded on each release. The seed command is safe to run again.
+### Tests and build
 
-## Section 4 — AI reflection
+```bash
+cd backend
+DEBUG=true python manage.py test
 
-1. I used AI to file source into the paths I named and to strip comments, to draft commit messages, to list which backend files were still empty, to boot the API and the Vite app locally, and to draft this README, `build.sh`, `render.yaml`, and the GitHub Actions workflow. I wrote the booking rules, models, and UI myself and checked the result against the tests.
+# In frontend/
+npm run lint
+npm run build
+```
 
-2. One paste of `backend/clinic/services/booking.py` was cut off at `return app`. I asked for that file to be placed as given. The suggestion finished the function as `return appt`, which is the appointment loaded in that function. Leaving the truncated name would have raised `NameError` on every reschedule. I kept that correction and re-read the function before committing.
+### Deployment and CI/CD
 
-3. While starting the app, `frontend/src/time.js` was still empty, so the tool invented formatters. I caught it because the page is supposed to show Nairobi times in a specific shape: 12-hour labels, a narrow no-break space, `dayKey` via `en-CA`, and `addDays` from a UTC date key. The invented file did not match. I replaced it with the version I had written and only then treated the page as ready.
+The project uses `render.yaml` and `build.sh` for a Render native Python web service and PostgreSQL database. The build script installs dependencies, builds React, collects static files, runs migrations, and seeds the five doctors. Gunicorn starts Django.
 
-4. I decided, without asking the tool, that cancelled visits stay stored and that only `booked` rows compete for a slot. Deleting the row would make the slot free too, but the clinic would lose the reason and the time of cancellation. I also decided that open slots are computed from weekly hours instead of being inserted as empty rows. Storing every future slot means a schedule change has to rewrite rows nobody has booked. Generating them keeps the working-hours table as the only schedule.
+GitHub Actions (`.github/workflows/ci-cd.yml`) runs backend tests against PostgreSQL 16, checks migrations, and lints/builds the frontend on every pull request. A push or merge to **`main`** runs the checks again; if they pass, the workflow triggers Render using a deploy hook and checks `/health`.
+
+**To activate deployment:**
+
+1. Commit `frontend/package-lock.json` and ensure `build.sh` is executable (`chmod +x build.sh`).
+2. Push the repository to GitHub and create a Render Blueprint from `render.yaml`.
+3. Add the Render deploy-hook URL as the GitHub secret `RENDER_DEPLOY_HOOK_URL`.
+4. Add the live application URL as the GitHub Actions variable `APP_URL`.
+5. Merge a pull request into `main`, check GitHub Actions and Render logs, then confirm the deployed app and API health endpoint are responding.
+
+**Note:** The public URL is supplied for deployment. Confirm that the app and `/health` endpoint respond and that GitHub Actions completes successfully. A health check does not independently prove that the newest commit is running.
+
+## 4. AI reflection
+
+### 1. What did you use AI for across the four sections?
+
+I used ChatGPT during the system design phase to explore architectural approaches and organize the project into maintainable modules. AI helped me identify how to separate database models, API serializers, business logic, views, and automated tests.
+
+I reviewed the suggested structure and organized the Django backend into dedicated services for booking and availability calculations. I also structured the React frontend around reusable components to keep the user interface maintainable.
+
+AI was particularly useful in helping me consider separation of concerns and potential edge cases. However, I remained responsible for understanding the architecture, evaluating the suggested design, and ensuring it aligned with the clinic booking requirements.
+
+For implementation and testing, I used AI-generated drafts for the Django API, React interface, and test cases. AI also helped draft the Render and GitHub Actions configuration. I reviewed these suggestions against the requirements and code.
+
+### 2. Give one example where an AI suggestion improved your work. What did you prompt it with?
+
+AI suggested a PostgreSQL partial unique constraint to prevent two active bookings for the same doctor and time. This is safer than checking availability in application code alone because two requests can arrive together. Cancelled appointments can still keep their history without blocking a new booking.
+
+**Prompt:**
+
+> How can I prevent two patients from booking the same 30-minute slot at the same time in Django REST Framework and PostgreSQL, while allowing cancelled slots to be booked again?
+
+
+### 3. Give one example where AI output was wrong or incomplete. How did you catch it?
+
+An AI-generated test treated **4:30 PM** as outside working hours for a doctor finishing at **5:00 PM**. But a 30-minute appointment starting at 4:30 PM ends exactly at 5:00 PM, so it is valid. The test expectation was corrected after checking it against the slot rules.
+
+
+### 4. Name two decisions you made without AI. Why did you trust your own judgment?
+
+**Technology stack:** I chose Django REST Framework and React with Vite because I have worked with Python APIs and React before. I could focus on the booking logic instead of learning a new stack.
+
+**Deployment simplicity:** After reviewing the requirements and considering the available options, I made the final decision to remove Docker. Render supports native Python deployment, so containers would add unnecessary setup for this project.
