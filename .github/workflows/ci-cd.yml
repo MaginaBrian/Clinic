@@ -3,7 +3,6 @@ name: CI/CD
 on:
   pull_request:
   push:
-    branches: [main]
 
 jobs:
   test:
@@ -23,18 +22,3 @@ jobs:
           DEBUG: "1"
           SECRET_KEY: ci-test-key
         run: python manage.py test clinic --verbosity=1
-
-  deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy to Render
-        env:
-          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
-        run: |
-          if [ -z "$RENDER_DEPLOY_HOOK" ]; then
-            echo "RENDER_DEPLOY_HOOK is not set. Add the Render deploy hook as a repository secret."
-            exit 1
-          fi
-          curl --fail-with-body -fsS -X POST "$RENDER_DEPLOY_HOOK"
